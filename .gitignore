@@ -1,0 +1,12 @@
+*.class
+out/
+build/
+bin/
+.idea/
+*.iml
+*.log
+*~
+*.swp
+.DS_Store
+Thumbs.db
+
