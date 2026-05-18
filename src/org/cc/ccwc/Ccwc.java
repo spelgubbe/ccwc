@@ -1,6 +1,8 @@
 package org.cc.ccwc;
 
 import java.io.*;
+import java.nio.file.Files;
+import java.nio.file.InvalidPathException;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
@@ -8,20 +10,90 @@ import java.util.regex.Pattern;
 
 public class Ccwc {
 
+    private static final List<Arg> DASH_ARGS = List.of (new CountWords (), new CountBytes (),
+							new CountLines (), new CountChars ());
+
     /**
      * Default is that wc shows counts of: lines TAB words TAB bytes.
      */
     private record Options (boolean countLines, boolean countWords,
 			    boolean countBytes, boolean countChars,
-			    Path filePath) {
+			    List<String> filePaths) {
 
 	public static Options defaults () {
 	    return new Options (true, true, true, false, null);
 	}
+
+	public Options withFilePaths (List<String> paths) {
+	    return new Options (countLines, countWords, countBytes, countChars, paths);
+	}
+
+	public boolean hasFilePaths () {
+	    return filePaths != null && !filePaths.isEmpty ();
+	}
     }
 
     private record WcResult (long numLines, long numWords, long numBytes, long numChars) {
-    	// empty
+    	public static WcResult sum (WcResult a, WcResult b) {
+	    long numLines = a.numLines + b.numLines;
+	    long numWords = a.numWords + b.numWords;
+	    long numBytes = a.numBytes + b.numBytes;
+	    long numChars = a.numChars + b.numChars;
+	    return new WcResult (numLines, numWords, numBytes, numChars);
+	}
+    }
+
+    private sealed interface FilePathResult {
+	record NOT_EXISTS () implements FilePathResult { }
+	record IS_DIRECTORY () implements FilePathResult {}
+	record INVALID_PATH () implements FilePathResult {}
+	record Valid (Path p) implements FilePathResult {}
+    }
+
+    private static FilePathResult readFilePath (String filePath) {
+	try {
+	    Path p = Path.of (filePath);
+	    if (Files.notExists (p)) {
+		return new FilePathResult.NOT_EXISTS ();
+	    } else if (Files.isDirectory (p)) {
+	    	return new FilePathResult.IS_DIRECTORY ();
+	    }
+	    return new FilePathResult.Valid (p);
+	} catch (InvalidPathException e) {
+	    return new FilePathResult.INVALID_PATH ();
+	}
+    }
+
+    private static void handleFiles (Options options) throws IOException {
+	List<String> filePaths = options.filePaths ();
+	WcResult total = new WcResult (0, 0, 0, 0);
+	for (String filePath : filePaths) {
+	    total = handleFile (filePath, options, total);
+	}
+	if (filePaths.size () > 1) { // write totals if there is more than one input file given
+	    writeResult (options, "total", total);
+	}
+    }
+
+    private static WcResult handleFile (String filePath, Options options, WcResult totalCounter)
+    throws IOException {
+	FilePathResult pathResult = readFilePath (filePath);
+	switch (pathResult) {
+	    case FilePathResult.INVALID_PATH (), FilePathResult.NOT_EXISTS () -> {
+		System.err.println ("wc: " +  filePath + ": No such file or directory");
+	    }
+	    case FilePathResult.IS_DIRECTORY ()-> {
+		System.err.println ("wc: " + filePath +  ": Is a directory");
+	    }
+	    case FilePathResult.Valid (Path p) -> {
+		try (InputStream fis = Files.newInputStream (p)) {
+		    WcResult wcResult = readStream (fis);
+		    writeResult (options, filePath, wcResult);
+		    return WcResult.sum (totalCounter, wcResult);
+		}
+	    }
+	}
+	return totalCounter;
     }
 
     private static class ByteCountingStream extends InputStream {
@@ -35,7 +107,7 @@ public class Ccwc {
 
 	@Override
 	public int read () throws IOException {
-	    // this relies on this method actually being called.
+	    // this count relies on this method actually being called.
 	    int read = delegate.read ();
 	    if (read != -1) { // treat end of stream as 0 bytes read
 		count++;
@@ -50,14 +122,21 @@ public class Ccwc {
 
     static void main (String[] args) throws IOException {
 
+	if (!validateOrPrintUsage (args)) {
+	    System.exit (-1);
+	}
 	Options options = parseOptions (args);
-	WcResult wcResult = readStream ();
-	writeResult (options, wcResult);
+	if (options.hasFilePaths ()) {
+	    handleFiles (options);
+	} else {
+	    WcResult wcResult = readStream (System.in);
+	    writeResult (options, null, wcResult);
+	}
     }
 
-    private static void writeResult (Options options, WcResult result) {
+    private static void writeResult (Options options, String resultName, WcResult result) {
 
-	List<Long> results = new ArrayList<> ();
+	List<Object> results = new ArrayList<> ();
 	if (options.countLines) {
 	    results.add (result.numLines);
 	}
@@ -70,25 +149,27 @@ public class Ccwc {
 	if (options.countChars) {
 	    results.add (result.numChars);
 	}
-	writeTabbedResults (results, System.out);
+	if (resultName != null) {
+	    results.add (resultName);
+	}
+	writeTabbedStrings (results, System.out);
     }
 
-    private static void writeTabbedResults (List<Long> counts, PrintStream ps) {
+    private static void writeTabbedStrings (List<Object> stats, PrintStream ps) {
 	boolean hasWritten = false;
-	for (Long count : counts) {
+	for (Object stat : stats) {
 	    if (hasWritten) {
 		ps.print ('\t');
 	    }
-	    ps.print (count);
+	    ps.print (stat);
 	    hasWritten = true;
 	}
 	ps.println ();
     }
 
-    private static WcResult readStream () throws IOException {
+    private static WcResult readStream (InputStream is) throws IOException {
 	// read stdin...
 	// start with just printing the bytes...
-	InputStream is = System.in;
 	// count the bytes
 	ByteCountingStream cis = new ByteCountingStream (is);
 
@@ -98,7 +179,6 @@ public class Ccwc {
 	// define chars read as the number of valid code points read
 	int charsRead = 0;
 	// trust the default charset
-	// java.nio.charset.Charset.defaultCharset
 	// use a reader to not reimplement bytes to unicode code points etc (for character counting)
 	Reader reader = new InputStreamReader (cis);
 	int codePoint;
@@ -107,7 +187,7 @@ public class Ccwc {
 	    if (codePoint == '\n') {
 		linesRead++;
 	    }
-	    charsRead += Character.charCount (codePoint);
+	    charsRead++;
 	    // whitespace breaks words. Newline and all related codepoints should be caught here.
 	    if (Character.isWhitespace (codePoint)) {
 		inWord = false;
@@ -120,10 +200,6 @@ public class Ccwc {
 	}
 
 	long bytesRead = cis.getByteCount ();
-	System.out.println ("Lines: " + linesRead);
-	System.out.println ("Words: " + wordsRead);
-	System.out.println ("Bytes: " + bytesRead);
-	System.out.println ("Chars: " + charsRead);
 	return new WcResult (linesRead, wordsRead, bytesRead, charsRead);
     }
 
@@ -157,16 +233,57 @@ public class Ccwc {
 	return first;
     }
 
+    private static boolean validateOrPrintUsage (String[] args) {
+	for (String arg : args) {
+	    if (arg.equals ("--help") || arg.equals ("--h")) {
+		printUsage ();
+		return false;
+	    } else {
+		// validate arg
+		if (!validateArg (arg)) {
+		    System.err.println ("ccwc: unknown argument '" + arg + "'");
+		    System.err.println ("Try 'wc --help' for more information.");
+		    return false;
+		}
+	    }
+	}
+	return true; // passes validation
+    }
+
+    private static void printUsage () {
+	String help = """
+		The options below may be used to select which counts are printed, always in
+		the following order: newline, word, character, and byte.
+		  -c, --bytes            print the byte counts
+		  -m, --chars            print the character counts
+		  -l, --lines            print the newline counts
+		  -w, --words            print the word counts
+		      --help     display this help and exit
+		""";
+	System.out.println (help);
+    }
+
 
     private static Options parseOptions (String[] args) {
 	boolean countLines = anyMatch (args, new CountLines ());
 	boolean countWords = anyMatch (args, new CountWords ());
 	boolean countBytes = anyMatch (args, new CountBytes ());
 	boolean countChars = anyMatch (args, new CountChars ());
+	List<String> filePaths = readFilePaths (args);
 	if (none (countLines, countWords, countBytes, countChars)) {
-	    return Options.defaults ();
+	    return Options.defaults ().withFilePaths (filePaths);
 	}
-	return new Options (countLines, countWords, countBytes, countChars, null);
+	return new Options (countLines, countWords, countBytes, countChars, filePaths);
+    }
+
+    private static List<String> readFilePaths (String[] args) {
+	List<String> paths = new ArrayList<> ();
+	for (String arg : args) {
+	    if (!isDashArg (arg)) {
+		paths.add (arg);
+	    }
+	}
+	return paths;
     }
 
     private static boolean none (boolean... bools) {
@@ -178,9 +295,19 @@ public class Ccwc {
 	return true;
     }
 
-    private record ArgParseResult (boolean matched, List<String> remainingArgs) {
-	// empty
+    private static boolean isDashArg (String arg) {
+	return arg.indexOf ('-') == 0;
     }
+
+    private static boolean validateArg (String arg) {
+	Arg anyDashArg = orArg (DASH_ARGS);
+	if (isDashArg (arg)) {
+	    return anyDashArg.matches (arg);
+	}
+	// non-dash args are interpreted as file paths
+	return true;
+    }
+
 
     private static boolean anyMatch (String[] args, Arg argument) {
 	for (String arg : args) {
@@ -191,6 +318,17 @@ public class Ccwc {
 	return false;
     }
 
+    private static Arg orArg (List<Arg> args) {
+	return argString -> {
+	    for (Arg arg1 : args) {
+		if (arg1.matches (argString)) {
+		    return true;
+		}
+	    }
+	    return false;
+	};
+    }
+
     private interface Arg {
 	boolean matches (String arg);
     }
@@ -199,7 +337,6 @@ public class Ccwc {
 	private final Pattern pattern;
 	public PatternArg (String pattern) {
 	    this.pattern = Pattern.compile (pattern);
-
 	}
 
 	@Override
@@ -210,25 +347,25 @@ public class Ccwc {
 
     private static class CountLines extends PatternArg {
 	public CountLines () {
-	    super ("-l");
+	    super ("-l|--lines");
 	}
     }
 
     private static class CountBytes extends PatternArg {
 	public CountBytes () {
-	    super ("-c");
+	    super ("-c|--bytes");
 	}
     }
 
     private static class CountWords extends PatternArg {
 	public CountWords () {
-	    super ("-w");
+	    super ("-w|--words");
 	}
     }
 
     private static class CountChars extends PatternArg {
 	public CountChars () {
-	    super ("-m");
+	    super ("-m|--chars");
 	}
     }
 }
